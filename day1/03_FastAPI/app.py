@@ -200,6 +200,67 @@ async def generate_simple(request: SimpleGenerationRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"応答の生成中にエラーが発生しました: {str(e)}")
 
+
+class ConversationRequest(BaseModel):
+    messages: List[Message]
+
+class ConversationResponse(BaseModel):
+    response: str
+    response_time: float
+
+@app.post("/predict", response_model=ConversationResponse)
+async def predict_conversation(request: ConversationRequest):
+    """messages形式を受け取って推論するエンドポイント"""
+    global model
+
+    if model is None:
+        print("predictエンドポイント: モデルが読み込まれていません。")
+        load_model_task()
+        if model is None:
+            raise HTTPException(status_code=503, detail="モデルが利用できません。")
+
+    try:
+        start_time = time.time()
+
+        # すべてのmessagesを1つのプロンプトに連結
+        prompt = ""
+        for message in request.messages:
+            role = message.role
+            content = message.content
+            if role == "user":
+                prompt += f"ユーザー: {content}\n"
+            elif role == "assistant":
+                prompt += f"アシスタント: {content}\n"
+        
+        # 最後のユーザー発言に対するアシスタント応答を生成
+        prompt += "アシスタント:"
+
+        print(f"生成用プロンプト:\n{prompt}")
+
+        outputs = model(
+            prompt,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9
+        )
+
+        assistant_response = extract_assistant_response(outputs, prompt)
+
+        end_time = time.time()
+        response_time = end_time - start_time
+
+        return ConversationResponse(
+            response=assistant_response,
+            response_time=response_time
+        )
+
+    except Exception as e:
+        print(f"predictエンドポイントでエラー発生: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="推論中にエラーが発生しました。")
+
+
 def load_model_task():
     """モデルを読み込むバックグラウンドタスク"""
     global model
@@ -257,8 +318,8 @@ def run_with_ngrok(port=8501):
         ngrok_tunnel = ngrok.connect(port)
         public_url = ngrok_tunnel.public_url
         print("---------------------------------------------------------------------")
-        print(f"✅ 公開URL:   {public_url}")
-        print(f"📖 APIドキュメント (Swagger UI): {public_url}/docs")
+        print(f"公開URL:   {public_url}")
+        print(f"APIドキュメント (Swagger UI): {public_url}/docs")
         print("---------------------------------------------------------------------")
         print("(APIクライアントやブラウザからアクセスするためにこのURLをコピーしてください)")
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")  # ログレベルをinfoに設定
