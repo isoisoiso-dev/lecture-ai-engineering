@@ -11,6 +11,56 @@ import pickle
 import time
 import great_expectations as gx
 
+# --- 既存 import に追加 ---
+import json
+from typing import Dict
+
+# --- 新規クラス ------------------------------------------------------
+class ModelComparator:
+    """現行モデルとベースラインモデルの比較を行うクラス"""
+
+    # ----------------- 内部ユーティリティ -----------------
+    @staticmethod
+    def _measure(model, X_test, y_test) -> Dict[str, float]:
+        """精度と推論時間を同時取得"""
+        start = time.time()
+        y_pred = model.predict(X_test)
+        elapsed = time.time() - start
+        acc = accuracy_score(y_test, y_pred)
+        return {"accuracy": acc, "inference_time": elapsed}
+
+    # ----------------- 外部 API ---------------------------
+    @staticmethod
+    def load_baseline_metrics(path: str = "models/baseline_metrics.json"):
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    @staticmethod
+    def save_metrics(metrics: Dict[str, float],
+                     path: str = "models/baseline_metrics.json"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(metrics, f, indent=2)
+
+    @staticmethod
+    def compare(current: Dict[str, float],
+                baseline: Dict[str, float] | None,
+                acc_tol: float = 0.01,
+                time_ratio: float = 1.2) -> bool:
+        """
+        精度 drop が acc_tol 以下、かつ推論時間が time_ratio 倍以内なら OK
+        baseline が無い場合は常に True
+        """
+        if baseline is None:
+            return True
+        return (
+            current["accuracy"] >= baseline["accuracy"] - acc_tol
+            and current["inference_time"] <= baseline["inference_time"] * time_ratio
+        )
+
+
 
 class DataLoader:
     """データロードを行うクラス"""
@@ -249,40 +299,62 @@ def test_model_performance():
     ), f"推論時間が長すぎます: {metrics['inference_time']}秒"
 
 
+import sys
+
+
 if __name__ == "__main__":
-    # データロード
+    # ─────────────────────────────────────
+    # 1. データロード & 前処理
+    # ─────────────────────────────────────
     data = DataLoader.load_titanic_data()
     X, y = DataLoader.preprocess_titanic_data(data)
 
-    # データバリデーション
+    # ─────────────────────────────────────
+    # 2. データバリデーション
+    # ─────────────────────────────────────
     success, results = DataValidator.validate_titanic_data(X)
     print(f"データ検証結果: {'成功' if success else '失敗'}")
     for result in results:
-        # "success": falseの場合はエラーメッセージを表示
         if not result["success"]:
             print(f"異常タイプ: {result['expectation_config']['type']}, 結果: {result}")
     if not success:
         print("データ検証に失敗しました。処理を終了します。")
-        exit(1)
+        sys.exit(1)
 
-    # モデルのトレーニングと評価
+    # ─────────────────────────────────────
+    # 3. モデルの学習・評価
+    # ─────────────────────────────────────
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-    # パラメータ設定
     model_params = {"n_estimators": 100, "random_state": 42}
-
-    # モデルトレーニング
     model = ModelTester.train_model(X_train, y_train, model_params)
-    metrics = ModelTester.evaluate_model(model, X_test, y_test)
 
-    print(f"精度: {metrics['accuracy']:.4f}")
-    print(f"推論時間: {metrics['inference_time']:.4f}秒")
+    current_metrics = ModelTester.evaluate_model(model, X_test, y_test)
+    print(f"精度: {current_metrics['accuracy']:.4f}")
+    print(f"推論時間: {current_metrics['inference_time']:.4f} 秒")
 
-    # モデル保存
-    model_path = ModelTester.save_model(model)
+    # ─────────────────────────────────────
+    # 4. ベースラインとの比較
+    # ─────────────────────────────────────
+    baseline_metrics = ModelComparator.load_baseline_metrics()
+    is_regression_free = ModelComparator.compare(
+        current_metrics,
+        baseline_metrics,
+        acc_tol=0.01,      # 精度 1pt 以内の低下を許容
+        time_ratio=1.2     # 推論時間 20% 以内の悪化を許容
+    )
+    print(f"ベースライン比較: {'合格' if is_regression_free else '不合格'}")
 
-    # ベースラインとの比較
-    baseline_ok = ModelTester.compare_with_baseline(metrics)
-    print(f"ベースライン比較: {'合格' if baseline_ok else '不合格'}")
+    if not is_regression_free:
+        sys.exit(1)  # CI を fail させる
+
+    # ─────────────────────────────────────
+    # 5. モデル／メトリクスの保存
+    # ─────────────────────────────────────
+    ModelTester.save_model(model, path="models/titanic_model.pkl")
+
+    # ベースラインが無い、または精度が改善した場合のみ更新
+    if baseline_metrics is None or current_metrics["accuracy"] > baseline_metrics["accuracy"]:
+        ModelComparator.save_metrics(current_metrics)
